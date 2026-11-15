@@ -1,5 +1,6 @@
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,10 @@ use libsignal_service::{
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
-    groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    groups_v2::{
+        decrypt_group, AccessRequired, GroupInviteLink, GroupJoinInfo, GroupsManager,
+        InMemoryCredentialsCache,
+    },
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
@@ -87,7 +91,16 @@ pub struct Registered {
     pub(crate) identified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Identified>>>>,
     pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
+    /// Serialises everything that reads and then writes Signal protocol sessions: decrypting
+    /// an envelope, encrypting a message, archiving sessions. Without it, a send and a receive
+    /// that interleave at the store's await points both load the same session record, and the
+    /// one stored last overwrites the other's ratchet step. The receiving chain that is lost
+    /// this way makes the peer's next messages fail with "invalid Whisper message: decryption
+    /// failed". Shared by the manager's clones.
+    pub(crate) protocol_lock: Arc<Mutex<()>>,
     pub(crate) link_preview_client: OnceLock<reqwest::Client>,
+    /// See [`Manager::set_automatic_link_previews`]; shared by the manager's clones.
+    pub(crate) automatic_link_previews: Arc<AtomicBool>,
 
     pub(crate) data: Arc<RegistrationData>,
 }
@@ -106,9 +119,19 @@ impl Registered {
             identified_websocket: Default::default(),
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
+            protocol_lock: Default::default(),
             link_preview_client: Default::default(),
+            automatic_link_previews: Arc::new(AtomicBool::new(true)),
             data: Arc::new(data),
         }
+    }
+
+    /// The text of `message` to fetch a link preview for, if it gets one automatically.
+    fn automatic_link_preview_body<'a>(&self, message: &'a DataMessage) -> Option<&'a str> {
+        if !self.automatic_link_previews.load(Ordering::Relaxed) || !message.preview.is_empty() {
+            return None;
+        }
+        message.body.as_deref()
     }
 
     fn servers(&self) -> SignalServers {
@@ -185,6 +208,20 @@ impl RegistrationData {
     }
 }
 
+impl<S> Manager<S, Registered> {
+    /// Whether [`Self::send_message`] and [`Self::send_message_to_group`] give a data message
+    /// without a preview one for its first link, as [`Self::link_preview`] does. On by default.
+    ///
+    /// Fetching the linked page reveals the user's IP address to its server. An app that leaves
+    /// this to its user turns it off, and sets a preview from [`Self::link_preview`] itself when
+    /// the user wants one. Applies to this manager's clones too.
+    pub fn set_automatic_link_previews(&self, enabled: bool) {
+        self.state
+            .automatic_link_previews
+            .store(enabled, Ordering::Relaxed);
+    }
+}
+
 impl<S: Store> Manager<S, Registered> {
     /// Loads a previously registered account from the implemented [Store].
     ///
@@ -223,8 +260,9 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Returns a clone of a cached push service (with credentials).
     ///
-    /// If no service is yet cached, it will create and cache one.
-    fn identified_push_service(&self) -> PushService {
+    /// If no service is yet cached, it will create and cache one. Public for requests presage
+    /// doesn't make itself, such as asking for a sticker pack's upload forms.
+    pub fn identified_push_service(&self) -> PushService {
         self.state.identified_push_service()
     }
 
@@ -354,6 +392,45 @@ impl<S: Store> Manager<S, Registered> {
             .expect("logic error"))
     }
 
+    /// For editing records without decoding them. `None` as for [`Self::storage_service`].
+    pub async fn storage_access(
+        &self,
+    ) -> Result<
+        Option<(
+            libsignal_service::push_service::PushService,
+            libsignal_service::master_key::StorageServiceKey,
+        )>,
+        Error<S::Error>,
+    > {
+        use libsignal_service::master_key::{MasterKey, StorageServiceKey};
+        let Some(pool) = self.account_entropy_pool().await? else {
+            return Ok(None);
+        };
+        let master_key =
+            MasterKey::from_slice(&pool.derive_svr_key()).expect("master keys have 32 bytes");
+        Ok(Some((
+            self.identified_push_service(),
+            StorageServiceKey::from_master_key(&master_key),
+        )))
+    }
+
+    /// `None` until the primary device has sent the account entropy pool.
+    pub async fn storage_service(
+        &self,
+    ) -> Result<Option<libsignal_service::StorageService>, Error<S::Error>> {
+        let Some(pool) = self.account_entropy_pool().await? else {
+            return Ok(None);
+        };
+        use libsignal_service::master_key::{MasterKey, StorageServiceKey};
+        // The SVR key is the account's master key.
+        let master_key =
+            MasterKey::from_slice(&pool.derive_svr_key()).expect("master keys have 32 bytes");
+        let key = StorageServiceKey::from_master_key(&master_key);
+        let service =
+            libsignal_service::StorageService::new(self.identified_push_service(), key).await?;
+        Ok(Some(service))
+    }
+
     async fn account_entropy_pool(&self) -> Result<Option<AccountEntropyPool>, Error<S::Error>> {
         let from_store = self.store().fetch_account_entropy_pool().await?;
 
@@ -436,6 +513,61 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// Updates the user's profile information.
+    /// Sets our username (a nickname gets a free discriminator) and returns it with its link.
+    pub async fn set_username(
+        &mut self,
+        nickname: &str,
+    ) -> Result<(String, Url), Error<S::Error>> {
+        let mut websocket = self.identified_websocket(false).await?;
+        let (username, link) = websocket.set_username(nickname).await?;
+        Ok((username.to_string(), link))
+    }
+
+    /// Uploads our whole profile: like [`Manager::update_profile`], also keeping, replacing or
+    /// removing the avatar.
+    pub async fn set_profile(
+        &mut self,
+        name: libsignal_service::profile_name::ProfileName<String>,
+        about: Option<String>,
+        emoji: Option<String>,
+        avatar: ProfileAvatar,
+    ) -> Result<(), Error<S::Error>> {
+        use libsignal_service::push_service::AvatarWrite;
+        let aci = self.state.data.service_ids.aci();
+        let profile_key = self.state.data.profile_key;
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(profile_key),
+        );
+        let mut reader = match &avatar {
+            ProfileAvatar::Set(bytes) => Some(std::io::Cursor::new(bytes.clone())),
+            _ => None,
+        };
+        let write = match (&avatar, &mut reader) {
+            (ProfileAvatar::Set(_), Some(reader)) => AvatarWrite::NewAvatar(reader),
+            (ProfileAvatar::Remove, _) => AvatarWrite::NoAvatar,
+            _ => AvatarWrite::RetainAvatar,
+        };
+        account_manager
+            .upload_versioned_profile(aci, name, about, emoji, write, &mut rand::rng())
+            .await?;
+
+        // The cached avatar would be shown otherwise; an empty one means none.
+        match avatar {
+            ProfileAvatar::Set(bytes) => {
+                let _ = self.store.save_profile_avatar(aci.into(), profile_key, &bytes).await;
+            }
+            ProfileAvatar::Remove => {
+                let _ = self.store.save_profile_avatar(aci.into(), profile_key, &Vec::new()).await;
+            }
+            ProfileAvatar::Keep => {}
+        }
+        let profile = account_manager.retrieve_profile(aci).await?;
+        let _ = self.store.save_profile(aci.into(), profile_key, profile).await;
+        Ok(())
+    }
+
     pub async fn update_profile(
         &mut self,
         name: libsignal_service::profile_name::ProfileName<String>,
@@ -479,8 +611,7 @@ impl<S: Store> Manager<S, Registered> {
             .try_into()
             .expect("Master key bytes to be of size 32.");
 
-        // Check if group avatar is cached.
-        // TODO: Is there some way to know if this is outdated?
+        // Cached, and kept current by `upsert_group`; empty means the group has none.
         if let Some(avatar) = self
             .store
             .group_avatar(master_key_bytes)
@@ -488,7 +619,7 @@ impl<S: Store> Manager<S, Registered> {
             .ok()
             .flatten()
         {
-            return Ok(Some(avatar));
+            return Ok(Some(avatar).filter(|avatar| !avatar.is_empty()));
         }
 
         let mut gm = Box::pin(self.groups_manager()).await?;
@@ -566,7 +697,9 @@ impl<S: Store> Manager<S, Registered> {
         Ok(Some(avatar))
     }
 
-    async fn groups_manager(
+    /// A groups manager for requests presage doesn't make itself, such as reading the parts of a
+    /// group its [`Group`] model leaves out.
+    pub async fn groups_manager(
         &self,
     ) -> Result<GroupsManager<InMemoryCredentialsCache>, Error<S::Error>> {
         let service_configuration = self.state.service_configuration();
@@ -617,6 +750,7 @@ impl<S: Store> Manager<S, Registered> {
             identified_push_service: PushService,
             service_ids: ServiceIds,
             message_sender: MessageSender<AciStore>,
+            protocol_lock: Arc<Mutex<()>>,
             account_entropy_pool: Option<AccountEntropyPool>,
             registration_type: RegistrationType,
         }
@@ -669,6 +803,7 @@ impl<S: Store> Manager<S, Registered> {
             identified_push_service,
             service_ids: self.state.data.service_ids.clone(),
             message_sender: self.new_message_sender().await?,
+            protocol_lock: self.state.protocol_lock.clone(),
             account_entropy_pool: self.account_entropy_pool().await?,
             registration_type: self.registration_type(),
         };
@@ -682,6 +817,7 @@ impl<S: Store> Manager<S, Registered> {
                         Some(Ok(Incoming::Envelope(envelope))) => {
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
+                                let _permit = state.protocol_lock.lock().await;
                                 match envelope.parse_destination_service_id() {
                                     None => {
                                         warn!("Message has no destination service ID, dropping.");
@@ -741,8 +877,10 @@ impl<S: Store> Manager<S, Registered> {
 
                                                 let mut message_sender =
                                                     state.message_sender.clone();
+                                                let protocol_lock = state.protocol_lock.clone();
                                                 let aci = state.service_ids.aci();
                                                 tokio::task::spawn_local(async move {
+                                                    let _permit = protocol_lock.lock().await;
                                                     let result = message_sender
                                                     .send_contact_details(
                                                         &ServiceId::Aci(aci),
@@ -771,11 +909,13 @@ impl<S: Store> Manager<S, Registered> {
                                             RequestType::Keys => {
                                                 let mut message_sender =
                                                     state.message_sender.clone();
+                                                let protocol_lock = state.protocol_lock.clone();
                                                 let account_entropy_pool = state
                                                     .account_entropy_pool
                                                     .as_ref()
                                                     .map(|aep| aep.to_string());
                                                 tokio::task::spawn_local(async move {
+                                                    let _permit = protocol_lock.lock().await;
                                                     let result = message_sender.send_sync_message(SyncMessage {
                                                         content: Some(SyncContent::Keys(libsignal_service::content::sync_message::Keys {
                                                             account_entropy_pool,
@@ -793,7 +933,9 @@ impl<S: Store> Manager<S, Registered> {
                                                 warn!("storing blocked user is not implemented yet! we will not report blocked users to the device requesting the sync.");
                                                 let mut message_sender =
                                                     state.message_sender.clone();
+                                                let protocol_lock = state.protocol_lock.clone();
                                                 tokio::task::spawn_local(async move {
+                                                    let _permit = protocol_lock.lock().await;
                                                     let result = message_sender.send_sync_message(SyncMessage {
                                                     content: Some(SyncContent::Blocked(libsignal_service::content::sync_message::Blocked {
                                                         numbers: vec![],
@@ -1051,7 +1193,9 @@ impl<S: Store> Manager<S, Registered> {
                                 debug!("device does not have the needed keys; requesting from primary device");
 
                                 let mut message_sender = state.message_sender.clone();
+                                let protocol_lock = state.protocol_lock.clone();
                                 tokio::task::spawn_local(async move {
+                                    let _permit = protocol_lock.lock().await;
                                     let result = message_sender
                                         .send_sync_message(SyncMessage {
                                             content: Some(SyncContent::Request(
@@ -1177,6 +1321,7 @@ impl<S: Store> Manager<S, Registered> {
 
         ensure_data_message_timestamp(&mut content_body, timestamp);
 
+        let permit = self.state.protocol_lock.lock().await;
         sender
             .send_message(
                 &recipient,
@@ -1187,6 +1332,7 @@ impl<S: Store> Manager<S, Registered> {
                 online_only,
             )
             .await?;
+        drop(permit);
 
         // save the message
         let content = Content {
@@ -1267,15 +1413,13 @@ impl<S: Store> Manager<S, Registered> {
         }))
     }
 
-    /// Sets a preview of the first link of a data message that has no preview yet.
+    /// Sets a preview of the first link of a data message that has no preview yet, unless
+    /// [automatic link previews](Self::set_automatic_link_previews) are off.
     async fn fetch_link_previews(&self, content_body: &mut ContentBody) {
         let ContentBody::DataMessage(message) = content_body else {
             return;
         };
-        if !message.preview.is_empty() {
-            return;
-        }
-        let Some(body) = message.body.as_deref() else {
+        let Some(body) = self.state.automatic_link_preview_body(message) else {
             return;
         };
         match self.link_preview(body).await {
@@ -1313,6 +1457,752 @@ impl<S: Store> Manager<S, Registered> {
         Ok(upload.await)
     }
 
+    /// Members without a known profile key are invited. Returns the master key and the
+    /// timestamp of the message telling the members.
+    pub async fn create_group(
+        &mut self,
+        title: &str,
+        members: &[Aci],
+    ) -> Result<([u8; 32], u64), Error<S::Error>> {
+        use libsignal_service::groups_v2::{
+            AccessControl, AccessRequired, GroupMemberCandidate, GroupOperations,
+        };
+        use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+
+        let master_key: [u8; 32] = rand::random();
+        let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new(master_key),
+        ));
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let server_public_params = groups_manager.server_public_params().clone();
+        let own = self.state.data.service_ids.aci();
+        let own_credential = self
+            .profile_key_credential(own, self.state.data.profile_key(), &server_public_params)
+            .await?;
+        let mut candidates = Vec::new();
+        for member in members.iter().filter(|m| **m != own) {
+            let credential = match self.store.profile_key(&(*member).into()).await? {
+                Some(key) => self
+                    .profile_key_credential(*member, key, &server_public_params)
+                    .await
+                    .inspect_err(|error| warn!(%error, "no profile key credential; inviting"))
+                    .ok(),
+                None => None,
+            };
+            candidates.push(GroupMemberCandidate {
+                service_id: (*member).into(),
+                credential,
+            });
+        }
+        // Signal's defaults for new groups.
+        let access = AccessControl {
+            attributes: AccessRequired::Member,
+            members: AccessRequired::Member,
+            add_from_invite_link: AccessRequired::Unsatisfiable,
+            member_label: AccessRequired::Member,
+        };
+        let group = operations
+            .encrypt_group_with_credentials(
+                title,
+                None,
+                None,
+                Some(&access),
+                &own_credential,
+                &candidates,
+                &server_public_params,
+                String::new(),
+                &mut rng(),
+            )
+            .map_err(|e| Error::ServiceError(e.into()))?;
+        groups_manager
+            .create_group(&mut rng(), &master_key, group)
+            .await?;
+        upsert_group(&self.store, &mut groups_manager, &master_key, &0).await?;
+        let message = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let recipients: Vec<ServiceId> = members
+            .iter()
+            .copied()
+            .filter(|m| *m != own)
+            .map(ServiceId::Aci)
+            .collect();
+        let timestamp = Self::now();
+        self.send_to_members(&master_key, &recipients, message, timestamp)
+            .await?;
+        Ok((master_key, timestamp))
+    }
+
+    /// Returns the timestamp of the message telling the members. Retried on a 409 conflict,
+    /// as Signal's apps do.
+    pub async fn change_group(
+        &mut self,
+        master_key: &[u8; 32],
+        change: GroupEdit,
+    ) -> Result<u64, Error<S::Error>> {
+        use libsignal_service::groups_v2::GroupOperations;
+        use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+        const ATTEMPTS: usize = 3;
+
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new(*master_key),
+        ));
+        let own = self.state.data.service_ids.aci();
+        let pni = self.state.data.service_ids.pni();
+        let leaving = matches!(change, GroupEdit::Leave | GroupEdit::DeclineInvitation);
+        // Uploaded once, whatever the attempts below.
+        let avatar_key = match &change {
+            GroupEdit::Avatar(avatar) if avatar.is_empty() => Some(String::new()),
+            GroupEdit::Avatar(avatar) => Some(
+                groups_manager
+                    .upload_avatar(&mut rng(), master_key, avatar)
+                    .await?,
+            ),
+            _ => None,
+        };
+        let mut attempt = 0;
+        let (group, revision, mut told, signed) = loop {
+            attempt += 1;
+            // The change must build on the latest revision.
+            let Some(group) =
+                upsert_group(&self.store, &mut groups_manager, master_key, &u32::MAX).await?
+            else {
+                return Err(Error::UnknownGroup);
+            };
+            let (actions, told) = self
+                .group_change_actions(
+                    &groups_manager,
+                    &operations,
+                    &group,
+                    change.clone(),
+                    avatar_key.clone(),
+                )
+                .await?;
+            let revision = actions.version;
+            match groups_manager
+                .modify_group(&mut rng(), master_key, actions)
+                .await
+            {
+                Ok(signed) => break (group, revision, told, signed),
+                Err(error) if is_conflict(&error) && attempt < ATTEMPTS => {
+                    debug!(
+                        attempt,
+                        "the group changed meanwhile; building the change again"
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        // After leaving, the server no longer shows us the group: update our copy here.
+        if leaving {
+            let mut left = group;
+            left.members.retain(|m| m.aci != own);
+            left.pending_members
+                .retain(|m| m.uuid != Uuid::from(own) && m.uuid != Uuid::from(pni));
+            left.revision = revision;
+            self.store.save_group(*master_key, left).await?;
+        } else {
+            upsert_group(&self.store, &mut groups_manager, master_key, &revision).await?;
+        }
+        if let GroupEdit::Avatar(avatar) = &change {
+            self.store.save_group_avatar(*master_key, avatar).await?;
+        }
+        let message = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(revision),
+                group_change: Some(libsignal_service::prelude::ProtobufMessage::encode_to_vec(
+                    &signed,
+                )),
+            }),
+            ..Default::default()
+        };
+        told.retain(|member| *member != ServiceId::Aci(own));
+        told.sort();
+        told.dedup();
+        let timestamp = Self::now();
+        self.send_to_members(master_key, &told, message, timestamp)
+            .await?;
+        Ok(timestamp)
+    }
+
+    /// The actions, and who is told: members and invitees before the change, plus those added.
+    async fn group_change_actions(
+        &self,
+        groups_manager: &GroupsManager<InMemoryCredentialsCache>,
+        operations: &libsignal_service::groups_v2::GroupOperations,
+        group: &Group,
+        change: GroupEdit,
+        avatar_key: Option<String>,
+    ) -> Result<
+        (
+            libsignal_service::proto::group_change::Actions,
+            Vec<ServiceId>,
+        ),
+        Error<S::Error>,
+    > {
+        use libsignal_service::groups_v2::{GroupInviteLink, Role};
+        use libsignal_service::proto::group_change::Actions;
+        let decoding =
+            |e| Error::ServiceError(libsignal_service::push_service::ServiceError::from(e));
+        let own = self.state.data.service_ids.aci();
+        let pni = self.state.data.service_ids.pni();
+        let invited_as = invited_as(group, own, pni);
+        let mut actions = Actions {
+            version: group.revision + 1,
+            ..Default::default()
+        };
+        let mut told = told_of_changes(group, own, pni);
+        match change {
+            GroupEdit::Title(title) => {
+                actions.modify_title =
+                    Some(operations.build_modify_title_action(&title, &mut rng()));
+            }
+            GroupEdit::Description(description) => {
+                actions.modify_description =
+                    Some(operations.build_modify_description_action(&description, &mut rng()));
+            }
+            GroupEdit::Avatar(_) => {
+                actions.modify_avatar =
+                    Some(operations.build_modify_avatar_action(avatar_key.unwrap_or_default()));
+            }
+            GroupEdit::Timer(seconds) => {
+                actions.modify_disappearing_message_timer = Some(
+                    operations.build_modify_disappearing_messages_timer_action(seconds, &mut rng()),
+                );
+            }
+            GroupEdit::AddMembers(members) => {
+                let server_public_params = groups_manager.server_public_params().clone();
+                for member in members {
+                    // Only an ACI with a profile key we have can be added outright.
+                    let credential = match member {
+                        ServiceId::Aci(aci) => match self.store.profile_key(&member).await? {
+                            Some(key) => self
+                                .profile_key_credential(aci, key, &server_public_params)
+                                .await
+                                .ok(),
+                            None => None,
+                        },
+                        ServiceId::Pni(_) => None,
+                    };
+                    match credential {
+                        Some(credential) => actions.add_members.push(
+                            operations.build_add_member_action_with_credential(
+                                &credential,
+                                Role::Default,
+                                &server_public_params,
+                            ),
+                        ),
+                        None => actions.add_members_pending_profile_key.push(
+                            operations
+                                .build_add_pending_member_action(member, own, Role::Default)
+                                .map_err(decoding)?,
+                        ),
+                    }
+                    told.push(member);
+                }
+            }
+            GroupEdit::RemoveMember(member) => {
+                actions.delete_members.push(
+                    operations
+                        .build_remove_member_action(member)
+                        .map_err(decoding)?,
+                );
+            }
+            GroupEdit::SetAdmin(member, admin) => {
+                let role = if admin {
+                    Role::Administrator
+                } else {
+                    Role::Default
+                };
+                actions.modify_member_roles.push(
+                    operations
+                        .build_modify_member_role_action(member, role)
+                        .map_err(decoding)?,
+                );
+            }
+            GroupEdit::Leave => {
+                actions.delete_members.push(
+                    operations
+                        .build_remove_member_action(own)
+                        .map_err(decoding)?,
+                );
+            }
+            GroupEdit::AcceptInvitation => {
+                use libsignal_service::proto::group_change::actions::{
+                    PromoteMemberPendingPniAciProfileKeyAction,
+                    PromoteMemberPendingProfileKeyAction,
+                };
+                let invited_as = invited_as.ok_or(Error::NotInvited)?;
+                // The server takes who we are and our profile key from the presentation.
+                let server_public_params = groups_manager.server_public_params().clone();
+                let credential = self
+                    .profile_key_credential(own, self.state.data.profile_key, &server_public_params)
+                    .await?;
+                let presentation =
+                    operations.create_member_presentation(&server_public_params, &credential);
+                match invited_as {
+                    ServiceId::Aci(_) => actions.promote_members_pending_profile_key.push(
+                        PromoteMemberPendingProfileKeyAction {
+                            presentation,
+                            ..Default::default()
+                        },
+                    ),
+                    // Invited by phone number: joining tells them our ACI too.
+                    ServiceId::Pni(_) => actions.promote_members_pending_pni_aci_profile_key.push(
+                        PromoteMemberPendingPniAciProfileKeyAction {
+                            presentation,
+                            ..Default::default()
+                        },
+                    ),
+                }
+            }
+            GroupEdit::DeclineInvitation => {
+                let invited_as = invited_as.ok_or(Error::NotInvited)?;
+                actions.delete_members_pending_profile_key.push(
+                    operations
+                        .build_remove_pending_member_action(invited_as)
+                        .map_err(decoding)?,
+                );
+            }
+            GroupEdit::InviteLinkAccess(access) => {
+                actions.modify_add_from_invite_link_access =
+                    Some(operations.build_modify_invite_link_access_action(access));
+                if access != AccessRequired::Unsatisfiable && group.invite_link_password.is_empty()
+                {
+                    actions.modify_invite_link_password =
+                        Some(operations.build_modify_invite_link_password_action(
+                            GroupInviteLink::new_password(&mut rng()),
+                        ));
+                }
+            }
+            GroupEdit::ResetInviteLink => {
+                actions.modify_invite_link_password =
+                    Some(operations.build_modify_invite_link_password_action(
+                        GroupInviteLink::new_password(&mut rng()),
+                    ));
+            }
+            GroupEdit::ApproveRequest(aci) => {
+                actions.promote_members_pending_admin_approval.push(
+                    operations
+                        .build_promote_requesting_member_action(aci, Role::Default)
+                        .map_err(decoding)?,
+                );
+                told.push(ServiceId::Aci(aci));
+            }
+            GroupEdit::DenyRequest(aci) => {
+                actions.delete_members_pending_admin_approval.push(
+                    operations
+                        .build_remove_requesting_member_action(aci)
+                        .map_err(decoding)?,
+                );
+            }
+            GroupEdit::AttributesAccess(access) => {
+                actions.modify_attributes_access =
+                    Some(operations.build_modify_attributes_access_action(access));
+            }
+            GroupEdit::MembersAccess(access) => {
+                actions.modify_member_access =
+                    Some(operations.build_modify_members_access_action(access));
+            }
+            GroupEdit::AnnouncementsOnly(only) => {
+                actions.modify_announcements_only =
+                    Some(operations.build_modify_announcements_only_action(only));
+            }
+            GroupEdit::Ban(who) => {
+                use crate::model::ServiceIdType;
+                if let ServiceId::Aci(aci) = who {
+                    if group.members.iter().any(|m| m.aci == aci) {
+                        actions.delete_members.push(
+                            operations
+                                .build_remove_member_action(aci)
+                                .map_err(decoding)?,
+                        );
+                    }
+                    if group.requesting_members.iter().any(|m| m.aci == aci) {
+                        actions.delete_members_pending_admin_approval.push(
+                            operations
+                                .build_remove_requesting_member_action(aci)
+                                .map_err(decoding)?,
+                        );
+                    }
+                }
+                let invited = group.pending_members.iter().any(|m| {
+                    let id = match m.service_id_type {
+                        ServiceIdType::AccountIdentity => ServiceId::Aci(m.uuid.into()),
+                        ServiceIdType::PhoneNumberIdentity => ServiceId::Pni(m.uuid.into()),
+                    };
+                    id == who
+                });
+                if invited {
+                    actions.delete_members_pending_profile_key.push(
+                        operations
+                            .build_remove_pending_member_action(who)
+                            .map_err(decoding)?,
+                    );
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default();
+                actions.add_members_banned.push(
+                    operations
+                        .build_ban_member_action(who, now)
+                        .map_err(decoding)?,
+                );
+            }
+            GroupEdit::WithdrawInvitation(who) => {
+                actions.delete_members_pending_profile_key.push(
+                    operations
+                        .build_remove_pending_member_action(who)
+                        .map_err(decoding)?,
+                );
+            }
+            GroupEdit::Unban(who) => {
+                actions.delete_members_banned.push(
+                    operations
+                        .build_unban_member_action(who)
+                        .map_err(decoding)?,
+                );
+            }
+        }
+        Ok((actions, told))
+    }
+
+    /// What a group shows to whoever has its invite link, and whether we asked to join
+    /// already.
+    pub async fn group_join_info(
+        &mut self,
+        link: &GroupInviteLink,
+    ) -> Result<GroupJoinInfo, Error<S::Error>> {
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        Ok(groups_manager.group_join_info(&mut rng(), link).await?)
+    }
+
+    /// Joins a group through its invite link, or asks to where administrators approve
+    /// members. Retried on a 409 conflict, as Signal's apps do.
+    pub async fn join_group(
+        &mut self,
+        link: &GroupInviteLink,
+    ) -> Result<GroupJoin, Error<S::Error>> {
+        use libsignal_service::groups_v2::GroupOperations;
+        use libsignal_service::proto::group_change::Actions;
+        const ATTEMPTS: usize = 3;
+
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let server_public_params = groups_manager.server_public_params().clone();
+        let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new(link.master_key),
+        ));
+        let own = self.state.data.service_ids.aci();
+        let credential = self
+            .profile_key_credential(own, self.state.data.profile_key, &server_public_params)
+            .await?;
+        let mut attempt = 0;
+        let (info, change) = loop {
+            attempt += 1;
+            let info = groups_manager.group_join_info(&mut rng(), link).await?;
+            if info.pending_admin_approval {
+                break (info, None);
+            }
+            let mut actions = Actions {
+                version: info.version + 1,
+                ..Default::default()
+            };
+            let member = match info.add_from_invite_link {
+                AccessRequired::Any => {
+                    actions.add_members.push(
+                        operations
+                            .build_join_from_invite_link_action(&credential, &server_public_params),
+                    );
+                    true
+                }
+                AccessRequired::Administrator => {
+                    actions.add_members_pending_admin_approval.push(
+                        operations.build_request_to_join_action(&credential, &server_public_params),
+                    );
+                    false
+                }
+                _ => return Err(Error::InviteLinkClosed),
+            };
+            let revision = actions.version;
+            match groups_manager
+                .modify_group_from_invite_link(&mut rng(), link, actions)
+                .await
+            {
+                Ok(signed) => break (info, Some((signed, revision, member))),
+                Err(error) if is_conflict(&error) && attempt < ATTEMPTS => {
+                    debug!(attempt, "the group changed meanwhile; joining again");
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let Some((signed, revision, true)) = change else {
+            // Not a member: the server shows us nothing more until we are let in. The members of
+            // a group we were in stay as we have them, to tell them we asked.
+            let known = self.store.group(link.master_key).await?;
+            let (members, pending_members) = known
+                .map(|known| (known.members, known.pending_members))
+                .unwrap_or_default();
+            let group = Group {
+                title: info.title,
+                avatar: info.avatar.clone(),
+                disappearing_messages_timer: None,
+                access_control: Some(crate::model::groups::AccessControl {
+                    attributes: AccessRequired::Member,
+                    members: AccessRequired::Member,
+                    add_from_invite_link: info.add_from_invite_link,
+                    member_label: AccessRequired::Member,
+                }),
+                revision: info.version,
+                members,
+                pending_members,
+                requesting_members: vec![crate::model::groups::RequestingMember {
+                    aci: own,
+                    profile_key: self.state.data.profile_key,
+                    timestamp: Self::now(),
+                }],
+                invite_link_password: link.password.clone(),
+                description: info.description_text,
+            };
+            let mut group = group;
+            let avatar = if info.avatar.is_empty() {
+                // None any more: a picture cached from before we left would stay, as later
+                // fetches find no picture on either side, and nothing to refresh.
+                Some(Vec::new())
+            } else {
+                match groups_manager
+                    .retrieve_avatar(&info.avatar, operations.group_secret_params)
+                    .await
+                {
+                    Ok(Some(avatar)) => Some(avatar),
+                    // Not cached: leave the path out, so the next fetch of the group gets it.
+                    Ok(None) => {
+                        group.avatar = String::new();
+                        None
+                    }
+                    Err(error) => {
+                        warn!(%error, "failed to fetch the group's avatar");
+                        group.avatar = String::new();
+                        None
+                    }
+                }
+            };
+            let told = told_of_changes(&group, own, self.state.data.service_ids.pni());
+            self.store.save_group(link.master_key, group).await?;
+            // After the group: its picture refers to it, and a group asked to join for the first
+            // time isn't stored before.
+            if let Some(avatar) = avatar {
+                self.store
+                    .save_group_avatar(link.master_key, &avatar)
+                    .await?;
+            }
+            if let Some((signed, revision, _)) = change {
+                self.tell_of_change(&link.master_key, &told, revision, &signed)
+                    .await?;
+            }
+            return Ok(GroupJoin::Requested);
+        };
+        let Some(group) = upsert_group(
+            &self.store,
+            &mut groups_manager,
+            &link.master_key,
+            &u32::MAX,
+        )
+        .await?
+        else {
+            return Err(Error::UnknownGroup);
+        };
+        let told: Vec<ServiceId> = group
+            .members
+            .iter()
+            .map(|m| ServiceId::Aci(m.aci))
+            .filter(|m| *m != ServiceId::Aci(own))
+            .collect();
+        let timestamp = self
+            .tell_of_change(&link.master_key, &told, revision, &signed)
+            .await?;
+        Ok(GroupJoin::Joined { timestamp })
+    }
+
+    /// Sends a signed change of a group to `told`; returns the message's timestamp.
+    async fn tell_of_change(
+        &mut self,
+        master_key: &[u8; 32],
+        told: &[ServiceId],
+        revision: u32,
+        signed: &libsignal_service::proto::GroupChange,
+    ) -> Result<u64, Error<S::Error>> {
+        let message = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(revision),
+                group_change: Some(libsignal_service::prelude::ProtobufMessage::encode_to_vec(
+                    signed,
+                )),
+            }),
+            ..Default::default()
+        };
+        let timestamp = Self::now();
+        self.send_to_members(master_key, told, message, timestamp)
+            .await?;
+        Ok(timestamp)
+    }
+
+    /// Withdraws the request made with [`Self::join_group`].
+    pub async fn cancel_join_request(
+        &mut self,
+        master_key: &[u8; 32],
+    ) -> Result<(), Error<S::Error>> {
+        use libsignal_service::groups_v2::GroupOperations;
+        use libsignal_service::proto::group_change::Actions;
+
+        let Some(group) = self.store.group(*master_key).await? else {
+            return Err(Error::UnknownGroup);
+        };
+        let link = GroupInviteLink {
+            master_key: *master_key,
+            password: group.invite_link_password,
+        };
+        let own = self.state.data.service_ids.aci();
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let info = groups_manager.group_join_info(&mut rng(), &link).await?;
+        let mut cancelled = None;
+        if info.pending_admin_approval {
+            let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
+                GroupMasterKey::new(*master_key),
+            ));
+            let mut actions = Actions {
+                version: info.version + 1,
+                ..Default::default()
+            };
+            actions.delete_members_pending_admin_approval.push(
+                operations
+                    .build_remove_requesting_member_action(own)
+                    .map_err(|e| Error::ServiceError(e.into()))?,
+            );
+            let revision = actions.version;
+            let signed = groups_manager
+                .modify_group_from_invite_link(&mut rng(), &link, actions)
+                .await?;
+            cancelled = Some((signed, revision));
+        }
+        // Read again: receiving may have replaced the group meanwhile.
+        let Some(mut group) = self.store.group(*master_key).await? else {
+            return Err(Error::UnknownGroup);
+        };
+        group.requesting_members.retain(|m| m.aci != own);
+        let told = told_of_changes(&group, own, self.state.data.service_ids.pni());
+        self.store.save_group(*master_key, group).await?;
+        if let Some((signed, revision)) = cancelled {
+            self.tell_of_change(master_key, &told, revision, &signed)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Fetches the group from the server whatever revision is stored, and stores it; an
+    /// error (403) if we are not in it.
+    pub async fn fetch_group(&mut self, master_key: &[u8; 32]) -> Result<Group, Error<S::Error>> {
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let avatar_path = self.store.group(*master_key).await?.map(|g| g.avatar);
+        fetch_group(&self.store, &mut groups_manager, *master_key, avatar_path).await?;
+        self.store
+            .group(*master_key)
+            .await?
+            .ok_or(Error::UnknownGroup)
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after 1970")
+            .as_millis() as u64
+    }
+
+    async fn profile_key_credential(
+        &self,
+        aci: Aci,
+        profile_key: ProfileKey,
+        server_public_params: &libsignal_service::zkgroup::ServerPublicParams,
+    ) -> Result<libsignal_service::zkgroup::profiles::ExpiringProfileKeyCredential, Error<S::Error>>
+    {
+        let mut websocket = self.identified_websocket(false).await?;
+        Ok(websocket
+            .retrieve_expiring_profile_key_credential(
+                &mut rng(),
+                aci,
+                profile_key,
+                server_public_params,
+            )
+            .await?)
+    }
+
+    /// For group changes, whose audience isn't the group as it is now. Failures are only
+    /// logged: the change is already made.
+    async fn send_to_members(
+        &mut self,
+        master_key: &[u8; 32],
+        members: &[ServiceId],
+        message: DataMessage,
+        timestamp: u64,
+    ) -> Result<(), Error<S::Error>> {
+        let mut content_body: ContentBody = message.into();
+        ensure_data_message_timestamp(&mut content_body, timestamp);
+        let mut sender = self.new_message_sender().await?;
+        let sender_certificate = self.sender_certificate().await?;
+        let mut recipients = Vec::new();
+        for member in members {
+            let unidentified_access =
+                self.store
+                    .profile_key(member)
+                    .await?
+                    .map(|profile_key| UnidentifiedAccess {
+                        key: profile_key.derive_access_key().to_vec(),
+                        certificate: sender_certificate.clone(),
+                    });
+            recipients.push((*member, unidentified_access, false));
+        }
+        let permit = self.state.protocol_lock.lock().await;
+        let results = sender
+            .send_message_to_group(recipients, content_body.clone(), timestamp, false)
+            .await;
+        drop(permit);
+        for result in results {
+            match result {
+                Ok(_) | Err(MessageSenderError::NotFound { .. }) => {}
+                Err(error) => warn!(%error, "failed to tell a member of a group change"),
+            }
+        }
+        let own = self.state.data.service_ids.aci();
+        let at = chrono::Utc.timestamp_millis_opt(timestamp as i64).unwrap();
+        let content = Content {
+            metadata: Metadata {
+                sender: own.into(),
+                destination: own.into(),
+                sender_device: self.state.device_id(),
+                server_guid: None,
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                pni_verified: None,
+            },
+            body: content_body,
+        };
+        self.store
+            .save_message(&Thread::Group(*master_key), content)
+            .await?;
+        Ok(())
+    }
+
     /// Sends one message in a group (v2). The `master_key_bytes` is required to have 32 elements.
     ///
     /// This method will automatically update the [DataMessage::expire_timer] if it is set to
@@ -1323,6 +2213,19 @@ impl<S: Store> Manager<S, Registered> {
         master_key_bytes: &[u8],
         message: impl Into<ContentBody>,
         timestamp: u64,
+    ) -> Result<Content, Error<S::Error>> {
+        self.send_message_to_group_except(master_key_bytes, message, timestamp, &[])
+            .await
+    }
+
+    /// Like [`Manager::send_message_to_group`], leaving out the members in `except` (for example
+    /// those whose changed safety number the user hasn't accepted yet).
+    pub async fn send_message_to_group_except(
+        &mut self,
+        master_key_bytes: &[u8],
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        except: &[Aci],
     ) -> Result<Content, Error<S::Error>> {
         let mut content_body = message.into();
         let master_key_bytes = master_key_bytes
@@ -1348,7 +2251,7 @@ impl<S: Store> Manager<S, Registered> {
         for member in group
             .members
             .into_iter()
-            .filter(|m| m.aci != self.state.data.service_ids.aci())
+            .filter(|m| m.aci != self.state.data.service_ids.aci() && !except.contains(&m.aci))
         {
             let unidentified_access =
                 self.store
@@ -1367,9 +2270,11 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         let online_only = false;
+        let permit = self.state.protocol_lock.lock().await;
         let results = sender
             .send_message_to_group(recipients, content_body.clone(), timestamp, online_only)
             .await;
+        drop(permit);
 
         // TODO: Handle the NotFound error in the future by removing all sessions to this UUID and marking it as unregistered, not sending any messages to this contact anymore.
         results
@@ -1589,6 +2494,7 @@ impl<S: Store> Manager<S, Registered> {
         trace!(recipient = %recipient.service_id_string(), "resetting session for address");
 
         let mut store = self.store.aci_protocol_store();
+        let permit = self.state.protocol_lock.lock().await;
 
         // Archive all sessions with all receiver devices.
         // Note that the "get_sub_device_sessions" does not include the main device, therefore add it.
@@ -1614,6 +2520,8 @@ impl<S: Store> Manager<S, Registered> {
         // TODO: Signal Android also deletes entries in some sender_key_shared table; we don't have such a table yet.
         // Does not seem necessary though.
 
+        drop(permit);
+
         // Send a null message.
         let message = NullMessage::generate(&mut rand::rng());
         self.send_message(*recipient, message, timestamp).await?;
@@ -1631,10 +2539,10 @@ impl<S: Store> Manager<S, Registered> {
             content: Some(SyncContent::CallEvent(event.clone())),
             ..SyncMessage::with_padding(&mut rand::rng())
         };
-        self.new_message_sender()
-            .await?
-            .send_sync_message(sync_message.clone())
-            .await?;
+        let mut sender = self.new_message_sender().await?;
+        let permit = self.state.protocol_lock.lock().await;
+        sender.send_sync_message(sync_message.clone()).await?;
+        drop(permit);
 
         let aci = self.state.data.service_ids.aci();
         // Filed under the start of the call.
@@ -1973,37 +2881,64 @@ async fn upsert_group<S: Store>(
     master_key_bytes: &[u8],
     revision: &u32,
 ) -> Result<Option<Group>, Error<S::Error>> {
-    let upsert_group = match store.group(master_key_bytes.try_into()?).await {
+    let master_key: [u8; 32] = master_key_bytes.try_into()?;
+    let (upsert_group, avatar_path) = match store.group(master_key).await {
         Ok(Some(group)) => {
             debug!(group_name =% group.title, "loaded group from local db");
-            group.revision < *revision
+            (group.revision < *revision, Some(group.avatar))
         }
-        Ok(None) => true,
+        Ok(None) => (true, None),
         Err(error) => {
             warn!(%error, "failed to retrieve group from local db");
-            true
+            (true, None)
         }
     };
 
     if upsert_group {
         debug!("fetching and saving group");
-        match groups_manager
-            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
-            .await
-        {
-            Ok(encrypted_group) => {
-                let group = decrypt_group(master_key_bytes, encrypted_group)?;
-                if let Err(error) = store.save_group(master_key_bytes.try_into()?, group).await {
-                    error!(%error, "failed to save group");
-                }
-            }
-            Err(error) => {
-                warn!(%error, "failed to fetch encrypted group")
-            }
+        if let Err(error) = fetch_group(store, groups_manager, master_key, avatar_path).await {
+            warn!(%error, "failed to fetch encrypted group");
         }
     }
 
     Ok(store.group(master_key_bytes.try_into()?).await?)
+}
+
+/// Fetches the group and stores it, refreshing the cached avatar if `avatar_path` (the stored
+/// one) is no longer the group's.
+async fn fetch_group<S: Store>(
+    store: &S,
+    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    master_key: [u8; 32],
+    avatar_path: Option<String>,
+) -> Result<(), Error<S::Error>> {
+    let encrypted_group = groups_manager
+        .fetch_encrypted_group(&mut rand::rng(), &master_key)
+        .await?;
+    let group = decrypt_group(&master_key, encrypted_group)?;
+    // A new picture, or none any more: the cached one is stale.
+    if avatar_path.is_some_and(|path| path != group.avatar) {
+        let avatar = if group.avatar.is_empty() {
+            Some(Vec::new())
+        } else {
+            groups_manager
+                .retrieve_avatar(
+                    &group.avatar,
+                    GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key)),
+                )
+                .await
+                .unwrap_or_default()
+        };
+        if let Some(avatar) = avatar {
+            if let Err(error) = store.save_group_avatar(master_key, &avatar).await {
+                warn!(%error, "failed to save the group avatar");
+            }
+        }
+    }
+    if let Err(error) = store.save_group(master_key, group).await {
+        error!(%error, "failed to save group");
+    }
+    Ok(())
 }
 
 /// Download and decrypt a sticker manifest
@@ -2400,4 +3335,282 @@ async fn register_pre_keys<S: Store>(
 
     trace!("registered pre keys");
     Ok(())
+}
+
+/// Whether a group change was refused because someone else changed the group meanwhile.
+fn is_conflict(error: &libsignal_service::push_service::ServiceError) -> bool {
+    matches!(
+        error,
+        libsignal_service::push_service::ServiceError::UnhandledResponseCode { status, .. }
+            if status.as_u16() == 409
+    )
+}
+
+/// Who is told of a change to `group`: its members and invitees as stored, without us. Signal's
+/// apps tell the same, also when we only ask to join a group we were in.
+fn told_of_changes(
+    group: &crate::model::groups::Group,
+    aci: Aci,
+    pni: libsignal_service::protocol::Pni,
+) -> Vec<ServiceId> {
+    use crate::model::ServiceIdType;
+    let mut told: Vec<ServiceId> = group.members.iter().map(|m| m.aci.into()).collect();
+    told.extend(
+        group
+            .pending_members
+            .iter()
+            .map(|m| match m.service_id_type {
+                ServiceIdType::AccountIdentity => ServiceId::Aci(m.uuid.into()),
+                ServiceIdType::PhoneNumberIdentity => ServiceId::Pni(m.uuid.into()),
+            }),
+    );
+    told.retain(|m| *m != ServiceId::Aci(aci) && *m != ServiceId::Pni(pni));
+    told.sort();
+    told.dedup();
+    told
+}
+
+/// Which of our identities `group` has an invitation for.
+fn invited_as(
+    group: &crate::model::groups::Group,
+    aci: Aci,
+    pni: libsignal_service::protocol::Pni,
+) -> Option<ServiceId> {
+    use crate::model::ServiceIdType;
+    group
+        .pending_members
+        .iter()
+        .find_map(|m| match m.service_id_type {
+            ServiceIdType::AccountIdentity if m.uuid == Uuid::from(aci) => {
+                Some(ServiceId::Aci(aci))
+            }
+            ServiceIdType::PhoneNumberIdentity if m.uuid == Uuid::from(pni) => {
+                Some(ServiceId::Pni(pni))
+            }
+            _ => None,
+        })
+}
+
+/// See [`Manager::set_profile`].
+#[derive(Debug, Clone)]
+pub enum ProfileAvatar {
+    Keep,
+    /// The picture's bytes (JPEG or PNG).
+    Set(Vec<u8>),
+    Remove,
+}
+
+/// See [`Manager::change_group`].
+#[derive(Debug, Clone)]
+pub enum GroupEdit {
+    Title(String),
+    /// Empty clears it.
+    Description(String),
+    /// The picture's bytes (JPEG or PNG, as Signal's clients send); empty clears it.
+    Avatar(Vec<u8>),
+    /// Seconds; 0 turns disappearing messages off.
+    Timer(u32),
+    /// Adds members we have a profile key for; invites the others, including PNIs.
+    AddMembers(Vec<ServiceId>),
+    RemoveMember(Aci),
+    /// Makes a member an administrator, or takes that back.
+    SetAdmin(Aci, bool),
+    Leave,
+    /// Joins a group we were invited to, by ACI or PNI.
+    AcceptInvitation,
+    /// Turns an invitation down.
+    DeclineInvitation,
+    /// Who the invite link lets in: `Unsatisfiable` turns it off, `Any` lets anyone join,
+    /// `Administrator` makes them ask. Turning it on makes a password if there is none.
+    InviteLinkAccess(AccessRequired),
+    /// A new password: the links given out so far stop working.
+    ResetInviteLink,
+    /// Lets someone in who asked to join.
+    ApproveRequest(Aci),
+    /// Turns their request down.
+    DenyRequest(Aci),
+    /// Who may change the title, description, avatar and timer: `Member` or `Administrator`.
+    AttributesAccess(AccessRequired),
+    /// Who may add members: `Member` or `Administrator`.
+    MembersAccess(AccessRequired),
+    /// Whether only administrators may send messages.
+    AnnouncementsOnly(bool),
+    /// Bans them, removing them first if they are a member, invited or asking to join.
+    Ban(ServiceId),
+    Unban(ServiceId),
+    /// Withdraws an invitation we (or another member) sent, by ACI or PNI.
+    WithdrawInvitation(ServiceId),
+}
+
+/// How [`Manager::join_group`] went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupJoin {
+    /// We are in; the members were told at this timestamp.
+    Joined { timestamp: u64 },
+    /// An administrator has to let us in. Meanwhile the group is stored with what the link
+    /// shows of it, and us among its requesting members.
+    Requested,
+}
+
+#[cfg(test)]
+mod invitation_tests {
+    use super::*;
+    use crate::model::{
+        groups::{Group, PendingMember},
+        ServiceIdType,
+    };
+
+    fn pending(uuid: Uuid, service_id_type: ServiceIdType) -> PendingMember {
+        PendingMember {
+            uuid,
+            service_id_type,
+            role: libsignal_service::groups_v2::Role::Default,
+            added_by_aci: Aci::from(Uuid::from_u128(9)),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn a_change_is_told_to_members_and_invitees_but_not_us() {
+        let aci = Aci::from(Uuid::from_u128(1));
+        let pni = libsignal_service::protocol::Pni::from(Uuid::from_u128(2));
+        let member = |n| crate::model::groups::Member {
+            aci: Aci::from(Uuid::from_u128(n)),
+            role: libsignal_service::groups_v2::Role::Default,
+            profile_key: ProfileKey::create([0; 32]),
+            joined_at_revision: 0,
+            label: None,
+            label_emoji: None,
+        };
+        let group = Group {
+            title: String::new(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 0,
+            members: vec![member(1), member(3)],
+            pending_members: vec![
+                pending(Uuid::from_u128(2), ServiceIdType::PhoneNumberIdentity),
+                pending(Uuid::from_u128(4), ServiceIdType::PhoneNumberIdentity),
+                pending(Uuid::from_u128(3), ServiceIdType::AccountIdentity),
+            ],
+            requesting_members: vec![],
+            invite_link_password: vec![],
+            description: None,
+        };
+        assert_eq!(
+            told_of_changes(&group, aci, pni),
+            vec![
+                ServiceId::Aci(Aci::from(Uuid::from_u128(3))),
+                ServiceId::Pni(libsignal_service::protocol::Pni::from(Uuid::from_u128(4))),
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_our_invitation_by_either_identity() {
+        let aci = Aci::from(Uuid::from_u128(1));
+        let pni = libsignal_service::protocol::Pni::from(Uuid::from_u128(2));
+        let group = |pending_members| Group {
+            title: String::new(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 0,
+            members: vec![],
+            pending_members,
+            requesting_members: vec![],
+            invite_link_password: vec![],
+            description: None,
+        };
+        assert_eq!(invited_as(&group(vec![]), aci, pni), None);
+        let by_aci = group(vec![pending(
+            Uuid::from_u128(1),
+            ServiceIdType::AccountIdentity,
+        )]);
+        assert_eq!(invited_as(&by_aci, aci, pni), Some(ServiceId::Aci(aci)));
+        let by_pni = group(vec![pending(
+            Uuid::from_u128(2),
+            ServiceIdType::PhoneNumberIdentity,
+        )]);
+        assert_eq!(invited_as(&by_pni, aci, pni), Some(ServiceId::Pni(pni)));
+        // Our ACI's UUID as someone's PNI (or the other way round) isn't us.
+        let mixed = group(vec![
+            pending(Uuid::from_u128(1), ServiceIdType::PhoneNumberIdentity),
+            pending(Uuid::from_u128(3), ServiceIdType::AccountIdentity),
+        ]);
+        assert_eq!(invited_as(&mixed, aci, pni), None);
+    }
+}
+
+#[cfg(test)]
+mod link_preview_tests {
+    use std::str::FromStr;
+
+    use libsignal_service::{
+        configuration::SignalServers,
+        prelude::{phonenumber::PhoneNumber, Uuid},
+        proto::DataMessage,
+        push_service::ServiceIds,
+        zkgroup::profiles::ProfileKey,
+    };
+
+    use super::{Registered, RegistrationData};
+    use crate::Manager;
+
+    fn manager() -> Manager<(), Registered> {
+        Manager {
+            store: (),
+            state: Registered::with_data(RegistrationData {
+                signal_servers: SignalServers::Production,
+                device_name: None,
+                phone_number: PhoneNumber::from_str("+15555550100").unwrap(),
+                service_ids: ServiceIds {
+                    aci: Uuid::from_u128(1),
+                    pni: Uuid::from_u128(2),
+                },
+                password: String::new(),
+                device_id: None,
+                registration_id: 1,
+                pni_registration_id: None,
+                profile_key: ProfileKey::create([0; 32]),
+                ephemeral_backup_key: None,
+            }),
+        }
+    }
+
+    fn message(body: &str) -> DataMessage {
+        DataMessage {
+            body: Some(body.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_message_gets_a_link_preview_by_default() {
+        let manager = manager();
+        let message = message("https://example.org");
+        assert_eq!(
+            manager.state.automatic_link_preview_body(&message),
+            Some("https://example.org")
+        );
+    }
+
+    #[test]
+    fn a_message_with_a_preview_gets_none() {
+        let manager = manager();
+        let mut message = message("https://example.org");
+        message.preview.push(Default::default());
+        assert_eq!(manager.state.automatic_link_preview_body(&message), None);
+    }
+
+    #[test]
+    fn automatic_link_previews_turned_off_fetch_nothing_in_any_clone() {
+        let manager = manager();
+        let clone = manager.clone();
+        manager.set_automatic_link_previews(false);
+        let message = message("https://example.org");
+        assert_eq!(manager.state.automatic_link_preview_body(&message), None);
+        assert_eq!(clone.state.automatic_link_preview_body(&message), None);
+    }
 }
