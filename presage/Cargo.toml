@@ -13,7 +13,12 @@ cdsi = ["libsignal-service/cdsi"]
 
 [dependencies]
 # corvus integration: upstream + whisperfish/libsignal-service-rs#473 and corvus' additions.
-libsignal-service = { git = "https://github.com/ada-h00k/libsignal-service-rs", rev = "ac4671b41fec9f381d24fc60f7c721e01650cf48", default-features = false, features = [
+# The contact-aci branch is based on ac4671b, the revision this presage snapshot is written
+# against, and adds the EmbeddedContact aciBinary field (16-byte serviceId, field 8) that the
+# official clients carry on shared contact cards — corvus-cli 1.6.0 sends and reads it, so
+# the recipient can message a UUID-only contact. (The fork's main has since picked up upstream
+# changes this presage snapshot cannot compile against yet.)
+libsignal-service = { git = "https://github.com/ada-h00k/libsignal-service-rs", branch = "contact-aci", default-features = false, features = [
     "phonenumber",
 ] }
 
